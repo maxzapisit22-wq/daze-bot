@@ -16,8 +16,12 @@ import json
 import tempfile
 from datetime import datetime
 
+# ─────────────────────────────────────────
+#  Config
+# ─────────────────────────────────────────
 load_dotenv()
 
+# รองรับ Railway: ถ้าไม่มีไฟล์ credentials.json ให้อ่านจาก env var แทน
 _creds_env = os.getenv("GOOGLE_CREDENTIALS_JSON")
 if _creds_env and not os.path.exists(os.getenv("CREDS_FILE", "credentials.json")):
     _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
@@ -27,114 +31,207 @@ if _creds_env and not os.path.exists(os.getenv("CREDS_FILE", "credentials.json")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 SHEET_ID      = os.getenv("SHEET_ID", "1btKWQ4K4gPO6IegDmoDYI9TlGdBNj5spvsBq2dOZqF0")
-LEADER_ROLE   = os.getenv("LEADER_ROLE", "Leader")
+LEADER_ROLE   = os.getenv("LEADER_ROLE", "Leader")   # ชื่อ Role ใน Discord ที่ใช้คำสั่ง !alert
 CREDS_FILE    = os.getenv("CREDS_FILE", "credentials.json")
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
+# ─────────────────────────────────────────
+#  Google Sheets — Cache 3 นาที
+# ─────────────────────────────────────────
 _cache = {"members": None, "activity": None, "ts": 0}
-CACHE_TTL = 180
+CACHE_TTL = 180  # seconds
+
 
 def _refresh_cache():
     global _cache
     if time.time() - _cache["ts"] < CACHE_TTL:
         return
+
     creds  = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
     gc     = gspread.authorize(creds)
     sheet  = gc.open_by_key(SHEET_ID)
+
+    # ── รายชื่อ sheet : col B (2) = รหัส, col C (3) = ชื่อในเกม, col H (8) = รวม ──
     ws_list = sheet.worksheet("รายชื่อ")
-    codes_m  = ws_list.col_values(2)[4:]
-    names_m  = ws_list.col_values(3)[4:]
+    codes_m  = ws_list.col_values(2)[4:]   # รหัส เช่น dz001
+    names_m  = ws_list.col_values(3)[4:]   # ชื่อในเกม
     scores   = ws_list.col_values(8)[4:]
+
     members = []
     for i, name in enumerate(names_m):
         if name.strip():
             score = 0.0
             if i < len(scores):
-                try: score = float(str(scores[i]).replace(",", ""))
-                except ValueError: score = 0.0
+                try:
+                    score = float(str(scores[i]).replace(",", ""))
+                except ValueError:
+                    score = 0.0
             code = codes_m[i].strip() if i < len(codes_m) else ""
             members.append({"name": name.strip(), "code": code, "score": score})
+
+    # ── คะแนนกิจ sheet : col B (2) = ชื่อในเกม, col AO (41) = สรุป ──
     ws_act  = sheet.worksheet("คะแนนกิจ")
-    names_a = ws_act.col_values(2)[5:]
-    att_raw = ws_act.col_values(41)[5:]
+    names_a = ws_act.col_values(2)[5:]     # skip 5 header rows, data starts row 6
+    att_raw = ws_act.col_values(41)[5:]    # AO = column 41
+
     activity = []
     for i, name in enumerate(names_a):
         if name.strip():
             att = 0
             if i < len(att_raw):
-                try: att = int(str(att_raw[i]).replace(",", ""))
-                except ValueError: att = 0
-            activity.append({"name": name.strip(), "attendance": att})
+                try:
+                    att = int(str(att_raw[i]).replace(",", ""))
+                except ValueError:
+                    att = 0
+            # แนบ code จาก members sheet ตาม index เดียวกัน
+            # (ทั้งสอง sheet ลำดับสมาชิกเหมือนกัน จึง join by position ได้)
+            code = codes_m[i].strip() if i < len(codes_m) else ""
+            activity.append({"name": name.strip(), "code": code, "attendance": att})
+
     _cache["members"]  = members
     _cache["activity"] = activity
     _cache["ts"]       = time.time()
+
 
 def get_members():
     _refresh_cache()
     return _cache["members"]
 
+
 def get_activity():
     _refresh_cache()
     return _cache["activity"]
 
+
 def find_member(name: str):
+    """ค้นหาจากรหัส (dz001) หรือ ชื่อในเกม แบบ case-insensitive + partial match"""
     n = name.strip().lower()
-    m = next((x for x in get_members() if n == x["code"].lower() or n in x["name"].lower()), None)
-    search_name = m["name"].lower() if m else n
-    a = next((x for x in get_activity() if search_name in x["name"].lower()), None)
+    members  = get_members()
+    activity = get_activity()
+
+    m = next((x for x in members
+              if n == x["code"].lower() or n in x["name"].lower()), None)
+
+    if not m:
+        # ไม่เจอ member — ลองค้นใน activity ตรงๆ
+        a = next((x for x in activity if n in x["name"].lower()), None)
+        return None, a
+
+    # ค้นชาจ activity ด้วย code ก่อน (กัน duplicate ชื่อในเกม)
+    code = m.get("code", "").lower()
+    if code:
+        a = next((x for x in activity if x.get("code", "").lower() == code), None)
+        if a:
+            return m, a
+
+    # Fallback: exact name match
+    search_name = m["name"].lower()
+    a = next((x for x in activity if search_name == x["name"].lower()), None)
     return m, a
 
+
+# ─────────────────────────────────────────
+#  Bot setup
+# ─────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+
 def has_leader_role():
+    """Permission check — ต้องมี Role ชื่อตาม LEADER_ROLE"""
     async def predicate(ctx):
         return any(r.name == LEADER_ROLE for r in ctx.author.roles)
     return commands.check(predicate)
+
 
 def att_emoji(att):
     if att >= 25: return "✅"
     if att >= 20: return "⚠️"
     return "🔴"
 
+
 def att_label(att):
     if att >= 25: return "Active"
-    if att >= 20: return "ปานกลาง"
+    if att >= 20: return "ปานกดาง"
     return "น้อย"
+
 
 def updated_footer():
     return f"อัปเดต {datetime.now().strftime('%d/%m/%Y %H:%M')}  •  DAZE Bot"
 
+
+# ─────────────────────────────────────────
+#  Events
+# ─────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"✅ DAZE Bot online — {bot.user}  (prefix: !)")
+
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CheckFailure):
         await ctx.send("🔒 คำสั่งนี้ใช้ได้เฉพาะ Leader เท่านั้น")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ ใส่ argument ไม่ครบ — พิมพ์ `!help` ดูวิธีใช้")
+        await ctx.send(f"❌ ใส่ argument ไม่ครบ —!พิมพ์ `!help` ดูวิธีใช้")
     else:
-        await ctx.send(f"❌ เกิดข้อผิดพลาด: `{error}`")
+        await ctx.send(f"❌ เกิดข้อผิดพลาด: {error}`")
 
+
+# ─────────────────────────────────────────
+#  !help
+# ─────────────────────────────────────────
 @bot.command(name="help")
 async def help_cmd(ctx):
-    embed = discord.Embed(title="🤖 DAZE Bot — คำสั่งทั้งหมด", color=0x5865F2)
-    embed.add_field(name="`!clan`",         value="สรุปภาพรวม Clan", inline=False)
-    embed.add_field(name="`!stat <ชื่อ>`", value="ดู stat รายคน", inline=False)
-    embed.add_field(name="`!rank`",         value="🏆 อันดับ 1–25", inline=False)
-    embed.add_field(name="`!rank2`",        value="🏆 อันดับ 26–50", inline=False)
-    embed.add_field(name="`!กิจ [ชื่อ]`",  value="Top 10 กิจกรรม หรือดูรายคน", inline=False)
-    embed.add_field(name="`!alert` 🔒", value="รายชื่อกิจน้อย (เฉพาะ Leader)", inline=False)
+    embed = discord.Embed(
+        title="🤖 DAZE Bot — คำสั่งทั้งหมด",
+        color=0x5865F2
+    )
+    embed.add_field(
+        name="`!clan`",
+        value="สรุปภาพรวม Clan (จำนวนสมาชิก, Avg Score, Active, กิจน้อย)",
+        inline=False
+    )
+    embed.add_field(
+        name="`!stat <ชื่อ>`",
+        value="ดู stat + กิจกรรมรายคน\nใช้รหัสหรือชื่อก็ได้ เช่น: `!stat dz001` หรือ `!stat SirT`",
+        inline=False
+    )
+    embed.add_field(
+        name="`!rank`",
+        value="🏆 อันดับ **1–25** ตามคะแนนรวม",
+        inline=False
+    )
+    embed.add_field(
+        name="`!rank2`",
+        value="🏆 อันดับ **26–50** ตามคะแนนรวม",
+        inline=False
+    )
+    embed.add_field(
+        name="`!กิจ [ชื่อ]`",
+        value="Top 10 กิจกรรม หรือดูรายคน\nตัวอย่าง: `!กิจ` หรือ `!กิจ MaxApply`",
+        inline=False
+    )
+    embed.add_field(
+        name="`!alert` 🔒",
+        value="รายชื่อสมาชิกที่มีกิจ < 20 ครั้ง (เฉพาะ Leader)",
+        inline=False
+    )
     embed.set_footer(text=updated_footer())
     await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────
+#  !clan — ภาพรวม
+# ─────────────────────────────────────────
 @bot.command(name="clan")
 async def clan_cmd(ctx):
     members  = get_members()
     activity = get_activity()
+
     total     = len(members)
     avg_score = round(sum(m["score"] for m in members) / total) if total else 0
     top_score = max(m["score"] for m in members) if members else 0
@@ -142,66 +239,103 @@ async def clan_cmd(ctx):
     active_20 = sum(1 for a in activity if a["attendance"] >= 20)
     low_att   = sum(1 for a in activity if a["attendance"] < 20)
     top_member = max(members, key=lambda x: x["score"]) if members else None
+
     embed = discord.Embed(title="🏰 DAZE Clan — ภาพรวม", color=0x5865F2)
-    embed.add_field(name="👥 สมาชิกทั้งหมด", value=f"**{total}** คน", inline=True)
-    embed.add_field(name="⭐ Avg Score",    value=f"**{avg_score:.1f}**", inline=True)
-    embed.add_field(name="🏆 Top Score",  value=f"**{top_score:.1f}**", inline=True)
-    embed.add_field(name="✅ Active (≥25)", value=f"**{active_25}** คน", inline=True)
-    embed.add_field(name="⚠️ ปานกลาง",  value=f"**{active_20-active_25}** คน", inline=True)
-    embed.add_field(name="🔴 กิจน้อย",   value=f"**{low_att}** คน", inline=True)
+    embed.add_field(name="👥 สมาชิกทั้งหมด", value=f"**{total}** คน",              inline=True)
+    embed.add_field(name="⭐ Avg Score",       value=f"**{avg_score:.1f}**",         inline=True)
+    embed.add_field(name="🏆 Top Score",        value=f"**{top_score:.1f}**",        inline=True)
+    embed.add_field(name="✅ Active (≥25 ครั้ง)", value=f"**{active_25}** คน",      inline=True)
+    embed.add_field(name="⚠️ ปานกลาง (20-24)",   value=f"**{active_20 - active_25}** คน", inline=True)
+    embed.add_field(name="🔴 กิจน้อย (<20)",      value=f"**{low_att}** คน",        inline=True)
     if top_member:
         embed.add_field(name="👑 อันดับ 1", value=f"**{top_member['name']}** ({top_member['score']:.1f})", inline=False)
     embed.set_footer(text=updated_footer())
     await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────
+#  !stat <ชื่อ>
+# ─────────────────────────────────────────
 @bot.command(name="stat")
 async def stat_cmd(ctx, *, name: str = None):
     if not name:
-        await ctx.send("❌ ระบุชื่อด้วยนะครับ")
+        await ctx.send("❌ ระบุชื่อด้วยนะครับ เช่น `!stat MaxApply`")
         return
+
     member, act = find_member(name)
+
     if not member:
-        await ctx.send(f"❌ ไม่พบ **{name}**")
+        await ctx.send(f"❌ ไม่พบสมาชิกชื่อ **{name}** — ลองพิมพ์ชื่อในเกมให้ตรงนะครับ")
         return
+
+    # คำนวณ rank
     sorted_m = sorted(get_members(), key=lambda x: x["score"], reverse=True)
-    rank = next((i+1 for i,m in enumerate(sorted_m) if m["name"]==member["name"]), "?")
+    rank = next((i + 1 for i, m in enumerate(sorted_m) if m["name"] == member["name"]), "?")
+
     att = act["attendance"] if act else 0
+
     code_str = f" `{member['code']}`" if member.get("code") else ""
-    embed = discord.Embed(title=f"👤 {member['name']}{code_str}",
-        color=0x57F287 if att>=25 else (0xFEE75C if att>=20 else 0xED4245))
-    embed.add_field(name="🏆 คะแนนรวม", value=f"**{member['score']:.1f}**", inline=True)
-    embed.add_field(name="📊 Rank", value=f"**#{rank}** / {len(sorted_m)}", inline=True)
-    embed.add_field(name=f"{att_emoji(att)} กิจกรรม", value=f"**{att}/36** — {att_label(att)}", inline=True)
+    embed = discord.Embed(
+        title=f"👤 {member['name']}{code_str}",
+        color=0x57F287 if att >= 25 else (0xFEE75C if att >= 20 else 0xED4245)
+    )
+    embed.add_field(name="🏆 คะแนนรวม",   value=f"**{member['score']:.1f}**",     inline=True)
+    embed.add_field(name="📊 Rank",        value=f"**#{rank}** / {len(sorted_m)}", inline=True)
+    embed.add_field(name=f"{att_emoji(att)} กิจกรรม",
+                    value=f"**{att}/36** ครั้ง — {att_label(att)}",               inline=True)
     embed.set_footer(text=updated_footer())
     await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────
+#  rank helper (shared logic)
+# ─────────────────────────────────────────
 async def send_rank_slice(ctx, start: int, end: int):
+    """ส่ง ranking ช่วง start–end (1-based index)"""
     members  = get_members()
     sorted_m = sorted(members, key=lambda x: x["score"], reverse=True)
-    medals   = ["🥇","🥈","🥉"]
-    slice_m  = sorted_m[start-1:end]
+    medals   = ["🥇", "🥈", "🥉"]
+
+    slice_m = sorted_m[start - 1 : end]   # slice ตาม index
     if not slice_m:
         await ctx.send(f"❌ ไม่มีข้อมูลอันดับ {start}–{end}")
         return
+
     lines = []
     for i, m in enumerate(slice_m):
         rank   = start + i
-        prefix = medals[rank-1] if rank <= 3 else f"`{rank:>2}.`"
+        prefix = medals[rank - 1] if rank <= 3 else f"`{rank:>2}.`"
         lines.append(f"{prefix} **{m['name']}** — {m['score']:.1f}")
+
     actual_end = start + len(slice_m) - 1
-    embed = discord.Embed(title=f"🏆 Ranking อันดับ {start}–{actual_end} — DAZE",
-        description="\n".join(lines), color=0xFEE75C)
+    embed = discord.Embed(
+        title=f"🏆 Ranking อันดับ {start}–{actual_end} — DAZE",
+        description="\n".join(lines),
+        color=0xFEE75C
+    )
     embed.set_footer(text=updated_footer())
     await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────
+#  !rank  →  อันดับ 1–25
+# ─────────────────────────────────────────
 @bot.command(name="rank")
 async def rank_cmd(ctx):
     await send_rank_slice(ctx, 1, 25)
 
+
+# ─────────────────────────────────────────
+#  !rank2  →  อันดับ 26–50
+# ─────────────────────────────────────────
 @bot.command(name="rank2")
 async def rank2_cmd(ctx):
     await send_rank_slice(ctx, 26, 50)
 
+
+# ─────────────────────────────────────────
+#  !กิจ [ชื่อ]
+# ─────────────────────────────────────────
 @bot.command(name="กิจ")
 async def activity_cmd(ctx, *, name: str = None):
     if name:
@@ -210,37 +344,69 @@ async def activity_cmd(ctx, *, name: str = None):
             await ctx.send(f"❌ ไม่พบ **{name}**")
             return
         att = act["attendance"]
-        embed = discord.Embed(title=f"📅 กิจกรรม — {act['name']}",
-            color=0x57F287 if att>=25 else (0xFEE75C if att>=20 else 0xED4245))
-        embed.add_field(name="เข้าร่วม", value=f"**{att}/36** ครั้ง", inline=True)
-        embed.add_field(name="สถานะ", value=f"{att_emoji(att)} {att_label(att)}", inline=True)
-        filled = round(att/38*10)
-        bar = "█"*filled+"░"*(10-filled)
+        embed = discord.Embed(
+            title=f"📅 กิจกรรม — {act['name']}",
+            color=0x57F287 if att >= 25 else (0xFEE75C if att >= 20 else 0xED4245)
+        )
+        embed.add_field(name="เข้าร่วม",  value=f"**{att}/36** ครั้ง", inline=True)
+        embed.add_field(name="สถานะ",     value=f"{att_emoji(att)} {att_label(att)}", inline=True)
+
+        # Progress bar (10 blocks)
+        filled = round(att / 38 * 10)
+        bar    = "█" * filled + "░" * (10 - filled)
         embed.add_field(name="Progress", value=f"`{bar}` {round(att/36*100)}%", inline=False)
         embed.set_footer(text=updated_footer())
         await ctx.send(embed=embed)
+
     else:
         activity = sorted(get_activity(), key=lambda x: x["attendance"], reverse=True)[:10]
-        lines = [f"`{i+1:>2}.` {att_emoji(a['attendance'])} **{a['name']}** — {a['attendance']}/36" for i,a in enumerate(activity)]
-        embed = discord.Embed(title="📅 Top 10 กิจกรรม — DAZE", description="\n".join(lines), color=0x57F287)
+        lines = [
+            f"`{i+1:>2}.` {att_emoji(a['attendance'])} **{a['name']}** — {a['attendance']}/36"
+            for i, a in enumerate(activity)
+        ]
+        embed = discord.Embed(
+            title="📅 Top 10 กิจกรรม — DAZE",
+            description="\n".join(lines),
+            color=0x57F287
+        )
         embed.set_footer(text=updated_footer())
         await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────
+#  !alert  [Leader only]
+# ─────────────────────────────────────────
 @bot.command(name="alert")
 @has_leader_role()
 async def alert_cmd(ctx):
     activity = get_activity()
-    low = sorted([a for a in activity if a["attendance"] < 20], key=lambda x: x["attendance"])
+    low = sorted(
+        [a for a in activity if a["attendance"] < 20],
+        key=lambda x: x["attendance"]
+    )
+
     if not low:
-        await ctx.send(embed=discord.Embed(title="✅ ไม่มีสมาชิกกิจน้อยกว่า 20 ครั้ง!", color=0x57F287))
+        embed = discord.Embed(
+            title="✅ ไม่มีสมาชิกที่กิจน้อยกว่า 20 ครั้ง!",
+            color=0x57F287
+        )
+        await ctx.send(embed=embed)
         return
+
     lines = [f"🔴 **{a['name']}** — {a['attendance']}/36 ครั้ง" for a in low]
-    embed = discord.Embed(title=f"⚠️ Alert — {len(low)} คน มีกิจน้อยกว่า 20 ครั้ง",
-        description="\n".join(lines), color=0xED4245)
+    embed = discord.Embed(
+        title=f"⚠️ Alert — {len(low)} คน มีกิจน้อยกว่า 20 ครั้ง",
+        description="\n".join(lines),
+        color=0xED4245
+    )
     embed.set_footer(text=updated_footer())
     await ctx.send(embed=embed)
 
+
+# ─────────────────────────────────────────
+#  Run
+# ─────────────────────────────────────────
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise ValueError("❌ ไม่พบ DISCORD_TOKEN")
+        raise ValueError("❌ ไม่พบ DISCORD_TOKEN — ดู .env.example")
     bot.run(DISCORD_TOKEN)
